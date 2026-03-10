@@ -1,0 +1,2 @@
+# 轻量版依赖（无需matplotlib）
+tkinter-tooltip==2.1.0
