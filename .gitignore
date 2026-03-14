@@ -80,3 +80,7 @@ proxy_icon.ico
 # Distribution files
 网络代理服务器*.exe
 网络代理服务器*.zip
+
+# config files
+proxy_config.json
+proxy_config.json.backup

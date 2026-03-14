@@ -15,8 +15,77 @@ import time
 import threading
 import queue
 import os
+import json
 from datetime import datetime
 import struct
+
+
+class ConfigManager:
+    """配置管理器 - 保存和加载代理服务器配置"""
+    
+    def __init__(self, config_file='proxy_config.json'):
+        self.config_file = config_file
+        self.backup_file = config_file + '.backup'
+        self.default_config = {
+            'host': '0.0.0.0',
+            'port': 7890,
+            'buffer_size': 1024,
+            'delay': 1,
+            'max_clients': 100,
+            'auto_start': False,
+            'server_running': False,
+            'last_start_time': None
+        }
+    
+    def save_config(self, config):
+        """保存配置到文件"""
+        try:
+            # 先备份现有配置
+            if os.path.exists(self.config_file):
+                import shutil
+                shutil.copy2(self.config_file, self.backup_file)
+            
+            # 保存新配置
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"保存配置失败: {e}")
+            return False
+    
+    def load_config(self):
+        """从文件加载配置"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    loaded_config = json.load(f)
+                    # 合并默认配置，确保所有必需的键都存在
+                    config = self.default_config.copy()
+                    config.update(loaded_config)
+                    return config
+            else:
+                return self.default_config.copy()
+        except Exception as e:
+            print(f"加载配置失败: {e}")
+            return self.default_config.copy()
+    
+    def get_current_config(self, gui_instance):
+        """从GUI实例获取当前配置"""
+        try:
+            config = {
+                'host': gui_instance.host_var.get(),
+                'port': int(gui_instance.port_var.get()),
+                'buffer_size': int(gui_instance.buffer_var.get()),
+                'delay': int(gui_instance.delay_var.get()),
+                'max_clients': int(gui_instance.max_clients_var.get()),
+                'auto_start': gui_instance.auto_start_var.get() if hasattr(gui_instance, 'auto_start_var') else False,
+                'server_running': gui_instance.proxy_server.running if hasattr(gui_instance, 'proxy_server') else False,
+                'last_start_time': gui_instance.last_start_time if hasattr(gui_instance, 'last_start_time') else None
+            }
+            return config
+        except Exception as e:
+            print(f"获取当前配置失败: {e}")
+            return self.default_config.copy()
 
 
 class ProxyServer:
@@ -772,8 +841,12 @@ class ProxyGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("网络代理服务器 - 支持HTTP/HTTPS/SOCKS5")
-        self.root.geometry("1200x800")  # 调整窗口尺寸
+        self.root.geometry("1200x800")  # 固定窗口大小
         self.root.minsize(1100, 700)   # 设置最小尺寸
+        
+        # 配置管理器
+        self.config_manager = ConfigManager()
+        self.config = self.config_manager.load_config()
         
         # 设置窗口图标和样式
         self.setup_window_style()
@@ -792,8 +865,21 @@ class ProxyGUI:
         # 创建界面
         self.create_widgets()
         
+        # 加载保存的配置
+        self.load_saved_config()
+        
         # 启动更新定时器
         self.update_gui()
+        
+        # 如果配置了自动启动，或者上次关闭时服务器正在运行，则启动服务器
+        should_auto_start = self.config.get('auto_start', False) or self.config.get('server_running', False)
+        if should_auto_start:
+            self.root.after(1000, self.auto_start_server)
+            if self.config.get('server_running', False):
+                self.add_log("检测到上次异常关闭，正在自动恢复服务...", 'info')
+            
+        # 绑定窗口关闭事件
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
     def setup_window_style(self):
         """设置窗口样式"""
@@ -813,6 +899,115 @@ class ProxyGUI:
         
         # 设置窗口居中
         self.center_window()
+        
+        # 创建菜单栏
+        self.create_menu_bar()
+        
+    def create_menu_bar(self):
+        """创建菜单栏"""
+        menubar = tk.Menu(self.root)
+        
+        # 文件菜单
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="保存配置", command=self.save_current_config)
+        file_menu.add_separator()
+        file_menu.add_command(label="退出", command=self.on_closing)
+        menubar.add_cascade(label="文件", menu=file_menu)
+        
+        # 配置菜单
+        config_menu = tk.Menu(menubar, tearoff=0)
+        config_menu.add_command(label="查看当前配置", command=self.show_current_config)
+        config_menu.add_separator()
+        config_menu.add_command(label="重置为默认配置", command=self.reset_to_default_config)
+        config_menu.add_command(label="恢复备份配置", command=self.restore_backup_config)
+        menubar.add_cascade(label="配置", menu=config_menu)
+        
+        # 帮助菜单
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="关于", command=self.show_about)
+        menubar.add_cascade(label="帮助", menu=help_menu)
+        
+        self.root.config(menu=menubar)
+        
+    def reset_to_default_config(self):
+        """重置为默认配置"""
+        try:
+            # 重置为默认配置
+            self.config = self.config_manager.default_config.copy()
+            self.config_manager.save_config(self.config)
+            
+            # 重新加载配置到界面
+            self.load_saved_config()
+            
+            self.add_log("配置已重置为默认值", 'info')
+            messagebox.showinfo("提示", "配置已重置为默认值")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"重置配置失败: {str(e)}")
+            
+    def show_about(self):
+        """显示关于对话框"""
+        about_text = "网络代理服务器 - 轻量版\n\n"
+        about_text += "支持 HTTP/HTTPS/SOCKS5 协议\n"
+        about_text += "具有实时监控、日志查看、流量统计等功能\n\n"
+        about_text += "配置会自动保存，下次启动时自动加载"
+        
+        messagebox.showinfo("关于", about_text)
+        
+    def restore_backup_config(self):
+        """恢复备份配置"""
+        try:
+            if os.path.exists(self.config_manager.backup_file):
+                # 从备份文件加载配置
+                with open(self.config_manager.backup_file, 'r', encoding='utf-8') as f:
+                    backup_config = json.load(f)
+                
+                # 更新当前配置
+                self.config = backup_config
+                self.config_manager.save_config(self.config)
+                
+                # 重新加载配置到界面
+                self.load_saved_config()
+                
+                self.add_log("已从备份恢复配置", 'info')
+                messagebox.showinfo("提示", "已从备份恢复配置")
+            else:
+                messagebox.showwarning("提示", "没有找到备份配置文件")
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"恢复备份配置失败: {str(e)}")
+            
+    def show_current_config(self):
+        """显示当前配置信息"""
+        try:
+            config_text = "当前配置信息：\n\n"
+            config_text += f"主机地址: {self.config.get('host', 'N/A')}\n"
+            config_text += f"端口: {self.config.get('port', 'N/A')}\n"
+            config_text += f"缓冲区大小: {self.config.get('buffer_size', 'N/A')} 字节\n"
+            config_text += f"延迟: {self.config.get('delay', 'N/A')} ms\n"
+            config_text += f"最大客户端数: {self.config.get('max_clients', 'N/A')}\n"
+            config_text += f"自动启动: {'是' if self.config.get('auto_start', False) else '否'}\n"
+            config_text += f"服务器运行状态: {'运行中' if self.config.get('server_running', False) else '已停止'}\n"
+            
+            last_start = getattr(self, 'last_start_time', None) or self.config.get('last_start_time')
+            if last_start:
+                try:
+                    last_start_dt = datetime.fromisoformat(last_start)
+                    time_str = last_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    config_text += f"上次启动时间: {time_str}\n"
+                except:
+                    config_text += "上次启动时间: 未知\n"
+            else:
+                config_text += "上次启动时间: 从未启动\n"
+                
+            config_text += f"\n配置文件: {self.config_manager.config_file}"
+            if os.path.exists(self.config_manager.backup_file):
+                config_text += f"\n备份文件: {self.config_manager.backup_file}"
+            
+            messagebox.showinfo("当前配置", config_text)
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"显示配置信息失败: {str(e)}")
         
     def setup_styles(self):
         """设置界面样式"""
@@ -996,6 +1191,16 @@ class ProxyGUI:
         )
         self.stop_button.pack(side=tk.LEFT)
         
+        # 自动启动复选框
+        self.auto_start_var = tk.BooleanVar(value=self.config.get('auto_start', False))
+        self.auto_start_check = ttk.Checkbutton(
+            button_frame,
+            text="自动启动",
+            variable=self.auto_start_var,
+            command=self.on_auto_start_changed
+        )
+        self.auto_start_check.pack(side=tk.LEFT, padx=(20, 0))
+        
     def create_status_panel(self, parent):
         """创建状态面板"""
         status_frame = ttk.LabelFrame(parent, text="服务器状态", padding="10")
@@ -1008,23 +1213,40 @@ class ProxyGUI:
             foreground=self.colors['danger'],
             font=('Arial', 12, 'bold')
         )
-        self.status_label.grid(row=0, column=0, columnspan=4, pady=(5, 10))
+        self.status_label.grid(row=0, column=0, columnspan=4, pady=(5, 5))
+        
+        # 上次运行时间显示 - 更醒目的样式
+        self.last_run_label = ttk.Label(
+            status_frame,
+            text="上次运行: 从未运行",
+            foreground=self.colors['info'],
+            font=('Arial', 9, 'italic')
+        )
+        self.last_run_label.grid(row=1, column=0, columnspan=4, pady=(0, 5))
+        
+        # 运行时长显示
+        self.run_duration_label = ttk.Label(
+            status_frame,
+            text="运行时长: 0小时0分钟",
+            foreground=self.colors['accent'],
+            font=('Arial', 8)
+        )
+        self.run_duration_label.grid(row=2, column=0, columnspan=4, pady=(0, 10))
         
         # 统计信息 - 两列布局
         stats_items = [
             ('总连接数:', 'total_connections'),
             ('活跃连接:', 'active_connections'),
             ('发送流量:', 'total_bytes_sent'),
-            ('接收流量:', 'total_bytes_received'),
-            ('运行时间:', 'uptime')
+            ('接收流量:', 'total_bytes_received')
         ]
         
         self.stats_labels = {}
         
-        # 两列布局，每行两个项目
+        # 两列布局，每行两个项目（总共2行，4个项目）
         for i, (label, key) in enumerate(stats_items):
-            row = i // 2 + 1  # 从第1行开始，因为第0行是状态指示器
-            col = (i % 2) * 2  # 0, 2, 0, 2, 0 列模式
+            row = i // 2 + 3  # 从第3行开始，因为第0行是状态指示器，第1行是上次运行时间，第2行是运行时长
+            col = (i % 2) * 2  # 0, 2, 0, 2 列模式
             
             ttk.Label(status_frame, text=label, font=('Arial', 9)).grid(row=row, column=col, sticky=tk.E, padx=(0, 3), pady=2)
             self.stats_labels[key] = ttk.Label(status_frame, text="0", font=('Arial', 9, 'bold'))
@@ -1164,8 +1386,24 @@ class ProxyGUI:
             buffer_size = int(self.buffer_var.get())
             delay = int(self.delay_var.get())
             max_clients = int(self.max_clients_var.get())
+
+            # 记录启动时间（在启动前记录）
+            self.last_start_time = datetime.now().isoformat()
+            self.add_log(f"正在启动服务器，时间: {self.last_start_time}", 'info')
             
+            # 立即更新界面上的上次运行时间显示
+            if hasattr(self, 'last_run_label'):
+                current_time = datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
+                self.last_run_label.config(text=f"上次运行: {current_time}")
+
             if self.proxy_server.start(host, port, buffer_size, delay, max_clients):
+                # 保存当前配置（包含服务器运行状态和启动时间）
+                current_config = self.config_manager.get_current_config(self)
+                current_config['server_running'] = True
+                current_config['last_start_time'] = self.last_start_time
+                self.config_manager.save_config(current_config)
+                self.add_log("配置已保存", 'info')
+                
                 # 更新界面状态
                 self.status_label.config(
                     text="● 运行中",
@@ -1202,6 +1440,14 @@ class ProxyGUI:
         """停止服务器"""
         try:
             self.proxy_server.stop()
+            
+                # 保存当前配置（包括停止状态，但保留上次启动时间）
+            current_config = self.config_manager.get_current_config(self)
+            current_config['server_running'] = False
+            # 保留上次启动时间，不要清空它
+            if hasattr(self, 'last_start_time') and self.last_start_time:
+                current_config['last_start_time'] = self.last_start_time
+            self.config_manager.save_config(current_config)
             
             # 更新界面状态
             self.status_label.config(
@@ -1248,6 +1494,162 @@ class ProxyGUI:
         # 继续更新
         self.root.after(100, self.update_gui)
         
+    def load_saved_config(self):
+        """加载保存的配置到界面"""
+        try:
+            # 设置基本配置
+            self.host_var.set(self.config.get('host', '0.0.0.0'))
+            self.port_var.set(str(self.config.get('port', 7890)))
+            self.buffer_var.set(str(self.config.get('buffer_size', 1024)))
+            self.delay_var.set(str(self.config.get('delay', 1)))
+            self.max_clients_var.set(str(self.config.get('max_clients', 100)))
+            
+            # 设置自动启动复选框（如果存在）
+            if hasattr(self, 'auto_start_var'):
+                self.auto_start_var.set(self.config.get('auto_start', False))
+            
+            # 加载上次启动时间
+            self.last_start_time = self.config.get('last_start_time')
+            
+            # 更新上次运行时间标签并显示详细信息
+            if self.last_start_time:
+                try:
+                    last_start_dt = datetime.fromisoformat(self.last_start_time)
+                    formatted_time = last_start_dt.strftime("%Y年%m月%d日 %H:%M:%S")
+                    self.last_run_label.config(text=f"上次运行: {formatted_time}")
+                    
+                    # 计算距离现在的时间
+                    time_diff = datetime.now() - last_start_dt
+                    days = time_diff.days
+                    hours = time_diff.seconds // 3600
+                    minutes = (time_diff.seconds % 3600) // 60
+                    
+                    if days > 0:
+                        time_ago = f"{days}天{hours}小时前"
+                    elif hours > 0:
+                        time_ago = f"{hours}小时{minutes}分钟前"
+                    elif minutes > 0:
+                        time_ago = f"{minutes}分钟前"
+                    else:
+                        time_ago = "刚刚"
+                        
+                    self.add_log(f"🕐 上次运行时间: {formatted_time}", 'info')
+                    self.add_log(f"⏰ 距离现在: {time_ago}", 'info')
+                    
+                    # 显示服务器状态信息
+                    if self.config.get('server_running', False):
+                        self.add_log("⚠️  注意: 上次程序异常关闭时服务器正在运行", 'warning')
+                    else:
+                        self.add_log("✅ 上次程序正常关闭", 'info')
+                        
+                except Exception as e:
+                    self.last_run_label.config(text=f"上次运行: {self.last_start_time}")
+                    self.add_log(f"上次启动时间: {self.last_start_time}", 'info')
+            else:
+                self.last_run_label.config(text="上次运行: 从未运行")
+                self.add_log("📅 这是您第一次运行本程序", 'info')
+            
+            # 显示配置加载信息
+            if os.path.exists(self.config_manager.config_file):
+                self.add_log("🚀 网络代理服务器启动中...", 'info')
+                self.add_log("📦 版本: v2.0 - 支持配置保存和自动恢复功能", 'info')
+                self.add_log("已加载保存的配置", 'info')
+                
+                # 显示配置摘要
+                config_summary = f"配置摘要 - 主机: {self.config.get('host')}:{self.config.get('port')}"
+                config_summary += f", 缓冲区: {self.config.get('buffer_size')}字节"
+                config_summary += f", 最大客户端: {self.config.get('max_clients')}"
+                config_summary += f", 自动启动: {'开启' if self.config.get('auto_start') else '关闭'}"
+                self.add_log(config_summary, 'info')
+                
+                if self.config.get('server_running', False):
+                    self.add_log("⚠️  检测到上次异常关闭，准备自动恢复...", 'warning')
+            else:
+                self.add_log("🎉 欢迎使用网络代理服务器！", 'info')
+                self.add_log("📦 版本: v2.0 - 支持配置保存和自动恢复功能", 'info')
+                self.add_log("💡 这是您第一次运行本程序，将使用默认配置", 'info')
+                self.add_log("🔧 您可以通过菜单栏保存和恢复配置", 'info')
+                
+        except Exception as e:
+            print(f"加载配置到界面失败: {e}")
+            self.add_log(f"加载配置失败: {str(e)}", 'error')
+            
+    def save_current_config(self):
+        """保存当前配置"""
+        try:
+            current_config = self.config_manager.get_current_config(self)
+            if self.config_manager.save_config(current_config):
+                self.add_log("配置已保存", 'info')
+                # 显示保存成功的视觉反馈
+                self.show_save_feedback()
+                return True
+            return False
+        except Exception as e:
+            print(f"保存配置失败: {e}")
+            self.add_log(f"保存配置失败: {str(e)}", 'error')
+            return False
+            
+    def show_save_feedback(self):
+        """显示保存成功的视觉反馈"""
+        try:
+            # 创建临时标签显示保存成功
+            feedback_label = ttk.Label(
+                self.root, 
+                text="✓ 配置已保存", 
+                foreground=self.colors['success'],
+                font=('Arial', 9)
+            )
+            feedback_label.place(relx=0.98, rely=0.02, anchor='ne')
+            
+            # 2秒后移除标签
+            self.root.after(2000, feedback_label.destroy)
+        except:
+            pass
+            
+    def auto_start_server(self):
+        """自动启动服务器"""
+        try:
+            # 记录自动启动时间
+            self.last_start_time = datetime.now().isoformat()
+            self.add_log(f"正在自动启动服务器... 时间: {self.last_start_time}", 'info')
+            
+            # 立即更新界面上的上次运行时间显示
+            if hasattr(self, 'last_run_label'):
+                current_time = datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
+                self.last_run_label.config(text=f"上次运行: {current_time}")
+                
+            self.start_server()
+        except Exception as e:
+            self.add_log(f"自动启动服务器失败: {str(e)}", 'error')
+            
+    def on_auto_start_changed(self):
+        """自动启动选项变更处理"""
+        try:
+            # 立即保存自动启动设置
+            current_config = self.config_manager.get_current_config(self)
+            self.config_manager.save_config(current_config)
+            status = "启用" if self.auto_start_var.get() else "禁用"
+            self.add_log(f"自动启动已{status}", 'info')
+        except Exception as e:
+            print(f"保存自动启动设置失败: {e}")
+            
+    def on_closing(self):
+        """窗口关闭时的处理"""
+        try:
+            # 保存当前配置
+            self.save_current_config()
+            
+            # 如果服务器正在运行，先停止它
+            if self.proxy_server.running:
+                self.proxy_server.stop()
+                
+            # 销毁窗口
+            self.root.destroy()
+            
+        except Exception as e:
+            print(f"关闭窗口时出错: {e}")
+            self.root.destroy()
+        
     def update_stats(self, stats):
         """更新统计信息"""
         # 更新统计标签
@@ -1256,10 +1658,30 @@ class ProxyGUI:
         self.stats_labels['total_bytes_sent'].config(text=self.format_bytes(stats['total_bytes_sent']))
         self.stats_labels['total_bytes_received'].config(text=self.format_bytes(stats['total_bytes_received']))
         
-        # 更新运行时间
+        # 更新运行时间（仅用于显示当前运行时长）
         if stats['start_time']:
             uptime = datetime.now() - stats['start_time']
-            self.stats_labels['uptime'].config(text=str(uptime).split('.')[0])
+            uptime_str = str(uptime).split('.')[0]
+            
+            # 更新运行时长标签
+            if hasattr(self, 'run_duration_label'):
+                total_seconds = int(uptime.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                seconds = total_seconds % 60
+                
+                if hours > 0:
+                    duration_text = f"运行时长: {hours}小时{minutes}分钟"
+                elif minutes > 0:
+                    duration_text = f"运行时长: {minutes}分钟{seconds}秒"
+                else:
+                    duration_text = f"运行时长: {seconds}秒"
+                    
+                self.run_duration_label.config(text=duration_text)
+        else:
+            # 服务器未运行时的处理
+            if hasattr(self, 'run_duration_label'):
+                self.run_duration_label.config(text="运行时长: 未运行")
         
         # 更新连接列表
         self.update_connections_list()
