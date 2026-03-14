@@ -978,18 +978,21 @@ class ProxyGUI:
             messagebox.showerror("错误", f"恢复备份配置失败: {str(e)}")
             
     def show_current_config(self):
-        """显示当前配置信息"""
+        """显示当前配置信息（从JSON文件重新加载最新配置）"""
         try:
-            config_text = "当前配置信息：\n\n"
-            config_text += f"主机地址: {self.config.get('host', 'N/A')}\n"
-            config_text += f"端口: {self.config.get('port', 'N/A')}\n"
-            config_text += f"缓冲区大小: {self.config.get('buffer_size', 'N/A')} 字节\n"
-            config_text += f"延迟: {self.config.get('delay', 'N/A')} ms\n"
-            config_text += f"最大客户端数: {self.config.get('max_clients', 'N/A')}\n"
-            config_text += f"自动启动: {'是' if self.config.get('auto_start', False) else '否'}\n"
-            config_text += f"服务器运行状态: {'运行中' if self.config.get('server_running', False) else '已停止'}\n"
+            # 从JSON文件重新加载最新配置
+            latest_config = self.config_manager.load_config()
             
-            last_start = getattr(self, 'last_start_time', None) or self.config.get('last_start_time')
+            config_text = "当前配置信息（从配置文件读取）：\n\n"
+            config_text += f"主机地址: {latest_config.get('host', 'N/A')}:{latest_config.get('port', 'N/A')}\n"
+            config_text += f"端口: {latest_config.get('port', 'N/A')}\n"
+            config_text += f"缓冲区大小: {latest_config.get('buffer_size', 'N/A')} 字节\n"
+            config_text += f"延迟: {latest_config.get('delay', 'N/A')} ms\n"
+            config_text += f"最大客户端数: {latest_config.get('max_clients', 'N/A')}\n"
+            config_text += f"自动启动: {'是' if latest_config.get('auto_start', False) else '否'}\n"
+            config_text += f"服务器运行状态: {'运行中' if latest_config.get('server_running', False) else '已停止'}\n"
+            
+            last_start = latest_config.get('last_start_time')
             if last_start:
                 try:
                     last_start_dt = datetime.fromisoformat(last_start)
@@ -1004,6 +1007,13 @@ class ProxyGUI:
             if os.path.exists(self.config_manager.backup_file):
                 config_text += f"\n备份文件: {self.config_manager.backup_file}"
             
+            # 添加内存配置和文件配置的对比信息
+            if self.config != latest_config:
+                config_text += "\n\n⚠️  注意：内存中的配置与配置文件不一致！"
+                config_text += "\n建议保存当前配置以保持一致性。"
+            else:
+                config_text += "\n\n✅ 内存配置与配置文件一致"
+                
             messagebox.showinfo("当前配置", config_text)
             
         except Exception as e:
