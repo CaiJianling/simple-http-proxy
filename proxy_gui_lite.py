@@ -34,7 +34,8 @@ class ConfigManager:
             'max_clients': 100,
             'auto_start': False,
             'server_running': False,
-            'last_start_time': None
+            'last_start_time': None,
+            'blacklist': []  # 黑名单IP列表
         }
     
     def save_config(self, config):
@@ -80,7 +81,8 @@ class ConfigManager:
                 'max_clients': int(gui_instance.max_clients_var.get()),
                 'auto_start': gui_instance.auto_start_var.get() if hasattr(gui_instance, 'auto_start_var') else False,
                 'server_running': gui_instance.proxy_server.running if hasattr(gui_instance, 'proxy_server') else False,
-                'last_start_time': gui_instance.last_start_time if hasattr(gui_instance, 'last_start_time') else None
+                'last_start_time': gui_instance.last_start_time if hasattr(gui_instance, 'last_start_time') else None,
+                'blacklist': gui_instance.blacklist if hasattr(gui_instance, 'blacklist') else []
             }
             return config
         except Exception as e:
@@ -166,6 +168,27 @@ class ProxyServer:
     def handle_client(self, client_socket, client_address):
         """处理客户端连接"""
         try:
+            # 检查黑名单
+            client_ip = client_address[0]
+            if hasattr(self, 'blacklist') and client_ip in self.blacklist:
+                # 拒绝黑名单IP的连接
+                if self.log_queue:
+                    self.log_queue.put({
+                        'type': 'error',
+                        'message': f"黑名单IP {client_ip} 尝试连接已被拒绝",
+                        'timestamp': datetime.now()
+                    })
+                
+                # 发送拒绝响应
+                try:
+                    error_response = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+                    client_socket.send(error_response)
+                except:
+                    pass
+                
+                client_socket.close()
+                return
+            
             # 更新统计信息
             self.stats['total_connections'] += 1
             self.stats['active_connections'] += 1
@@ -848,6 +871,9 @@ class ProxyGUI:
         self.config_manager = ConfigManager()
         self.config = self.config_manager.load_config()
         
+        # 黑名单
+        self.blacklist = self.config.get('blacklist', [])
+        
         # 设置窗口图标和样式
         self.setup_window_style()
         
@@ -918,6 +944,8 @@ class ProxyGUI:
         config_menu = tk.Menu(menubar, tearoff=0)
         config_menu.add_command(label="查看当前配置", command=self.show_current_config)
         config_menu.add_separator()
+        config_menu.add_command(label="黑名单管理", command=self.manage_blacklist)
+        config_menu.add_separator()
         config_menu.add_command(label="重置为默认配置", command=self.reset_to_default_config)
         config_menu.add_command(label="恢复备份配置", command=self.restore_backup_config)
         menubar.add_cascade(label="配置", menu=config_menu)
@@ -977,6 +1005,204 @@ class ProxyGUI:
         except Exception as e:
             messagebox.showerror("错误", f"恢复备份配置失败: {str(e)}")
             
+    def manage_blacklist(self):
+        """黑名单管理对话框"""
+        try:
+            # 创建黑名单管理窗口
+            blacklist_window = tk.Toplevel(self.root)
+            blacklist_window.title("黑名单管理")
+            blacklist_window.geometry("500x400")
+            blacklist_window.transient(self.root)
+            blacklist_window.grab_set()
+            
+            # 窗口居中
+            blacklist_window.update_idletasks()
+            x = (blacklist_window.winfo_screenwidth() - blacklist_window.winfo_width()) // 2
+            y = (blacklist_window.winfo_screenheight() - blacklist_window.winfo_height()) // 2
+            blacklist_window.geometry(f"+{x}+{y}")
+            
+            # 创建主框架
+            main_frame = ttk.Frame(blacklist_window, padding="10")
+            main_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # 标题
+            title_label = ttk.Label(main_frame, text="黑名单管理", font=('Arial', 12, 'bold'))
+            title_label.pack(pady=(0, 10))
+            
+            # 说明标签
+            desc_label = ttk.Label(main_frame, text="每行输入一个IP地址，黑名单中的IP将被拒绝连接")
+            desc_label.pack(pady=(0, 10))
+            
+            # 创建文本框和滚动条
+            text_frame = ttk.Frame(main_frame)
+            text_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+            
+            # 文本框
+            self.blacklist_text = tk.Text(text_frame, height=15, width=50, font=('Consolas', 10))
+            self.blacklist_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            
+            # 滚动条
+            scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.blacklist_text.yview)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            self.blacklist_text.configure(yscrollcommand=scrollbar.set)
+            
+            # 加载当前黑名单
+            current_blacklist = '\n'.join(self.blacklist)
+            self.blacklist_text.insert(1.0, current_blacklist)
+            
+            # 按钮框架
+            button_frame = ttk.Frame(main_frame)
+            button_frame.pack(fill=tk.X)
+            
+            # 保存按钮
+            save_btn = ttk.Button(button_frame, text="保存", command=lambda: self.save_blacklist(blacklist_window))
+            save_btn.pack(side=tk.RIGHT, padx=(5, 0))
+            
+            # 取消按钮
+            cancel_btn = ttk.Button(button_frame, text="取消", command=blacklist_window.destroy)
+            cancel_btn.pack(side=tk.RIGHT)
+            
+            # 清空按钮
+            clear_btn = ttk.Button(button_frame, text="清空", command=lambda: self.blacklist_text.delete(1.0, tk.END))
+            clear_btn.pack(side=tk.RIGHT, padx=(0, 5))
+            
+            # 示例按钮
+            example_btn = ttk.Button(button_frame, text="加载示例", command=self.load_blacklist_example)
+            example_btn.pack(side=tk.LEFT)
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"打开黑名单管理失败: {str(e)}")
+            
+    def save_blacklist(self, window):
+        """保存黑名单"""
+        try:
+            # 获取文本框内容
+            blacklist_text = self.blacklist_text.get(1.0, tk.END).strip()
+            
+            # 解析IP地址
+            if blacklist_text:
+                # 分割成行，去除空行和空格
+                ip_lines = [line.strip() for line in blacklist_text.split('\n') if line.strip()]
+                
+                # 验证IP地址格式
+                valid_ips = []
+                invalid_ips = []
+                
+                for ip in ip_lines:
+                    if self.is_valid_ip(ip):
+                        valid_ips.append(ip)
+                    else:
+                        invalid_ips.append(ip)
+                
+                if invalid_ips:
+                    response = messagebox.askyesno(
+                        "验证提示", 
+                        f"发现 {len(invalid_ips)} 个无效IP地址:\n{', '.join(invalid_ips)}\n\n"
+                        f"是否继续保存有效的 {len(valid_ips)} 个IP地址？"
+                    )
+                    if not response:
+                        return
+                
+                self.blacklist = valid_ips
+            else:
+                self.blacklist = []
+            
+            # 保存配置
+            self.save_current_config()
+            
+            # 记录日志
+            if self.blacklist:
+                self.add_log(f"黑名单已更新，包含 {len(self.blacklist)} 个IP地址", 'info')
+            else:
+                self.add_log("黑名单已清空", 'info')
+            
+            window.destroy()
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"保存黑名单失败: {str(e)}")
+            
+    def is_valid_ip(self, ip):
+        """验证IP地址格式"""
+        try:
+            # 简单的IP地址验证
+            parts = ip.split('.')
+            if len(parts) != 4:
+                return False
+            
+            for part in parts:
+                if not part.isdigit():
+                    return False
+                num = int(part)
+                if num < 0 or num > 255:
+                    return False
+            
+            return True
+        except:
+            return False
+            
+    def load_blacklist_example(self):
+        """加载黑名单示例"""
+        example_text = "# 黑名单示例 - 每行一个IP地址\n"
+        example_text += "# 可以添加注释（以#开头）\n\n"
+        example_text += "192.168.1.100\n"
+        example_text += "10.0.0.50\n"
+        example_text += "172.16.0.25\n"
+        
+        self.blacklist_text.delete(1.0, tk.END)
+        self.blacklist_text.insert(1.0, example_text)
+            
+    def add_to_blacklist(self):
+        """将选中的连接加入黑名单"""
+        try:
+            selected_items = self.conn_tree.selection()
+            if selected_items:
+                item = selected_items[0]
+                values = self.conn_tree.item(item)['values']
+                if values:
+                    ip = values[0]
+                    
+                    if ip not in self.blacklist:
+                        self.blacklist.append(ip)
+                        self.save_current_config()
+                        self.add_log(f"🚫 已将IP {ip} 加入黑名单", 'info')
+                        messagebox.showinfo("提示", f"已将IP {ip} 加入黑名单")
+                        
+                        # 断开该IP的所有连接
+                        self.disconnect_connection()
+                        
+                        # 更新连接列表
+                        self.update_connections_list()
+                    else:
+                        messagebox.showwarning("提示", f"IP {ip} 已在黑名单中")
+            else:
+                messagebox.showwarning("提示", "请先选择一个连接")
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"加入黑名单失败: {str(e)}")
+            
+    def remove_from_blacklist(self):
+        """从黑名单中移除选中的IP"""
+        try:
+            selected_items = self.conn_tree.selection()
+            if selected_items:
+                item = selected_items[0]
+                values = self.conn_tree.item(item)['values']
+                if values:
+                    ip = values[0]
+                    
+                    if ip in self.blacklist:
+                        self.blacklist.remove(ip)
+                        self.save_current_config()
+                        self.add_log(f"✅ 已将IP {ip} 从黑名单移除", 'info')
+                        messagebox.showinfo("提示", f"已将IP {ip} 从黑名单移除")
+                    else:
+                        messagebox.showwarning("提示", f"IP {ip} 不在黑名单中")
+            else:
+                messagebox.showwarning("提示", "请先选择一个连接")
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"从黑名单移除失败: {str(e)}")
+            
     def show_current_config(self):
         """显示当前配置信息（从JSON文件重新加载最新配置）"""
         try:
@@ -991,6 +1217,15 @@ class ProxyGUI:
             config_text += f"最大客户端数: {latest_config.get('max_clients', 'N/A')}\n"
             config_text += f"自动启动: {'是' if latest_config.get('auto_start', False) else '否'}\n"
             config_text += f"服务器运行状态: {'运行中' if latest_config.get('server_running', False) else '已停止'}\n"
+            
+            # 显示黑名单信息
+            blacklist = latest_config.get('blacklist', [])
+            config_text += f"黑名单IP数量: {len(blacklist)}\n"
+            if blacklist:
+                config_text += f"黑名单IP: {', '.join(blacklist[:5])}"
+                if len(blacklist) > 5:
+                    config_text += f" 等{len(blacklist)-5}个"
+                config_text += "\n"
             
             last_start = latest_config.get('last_start_time')
             if last_start:
@@ -1341,6 +1576,9 @@ class ProxyGUI:
         self.conn_menu.add_command(label="断开", command=self.disconnect_connection)
         self.conn_menu.add_command(label="复制IP", command=self.copy_connection_ip)
         self.conn_menu.add_separator()
+        self.conn_menu.add_command(label="加入黑名单", command=self.add_to_blacklist)
+        self.conn_menu.add_command(label="从黑名单移除", command=self.remove_from_blacklist)
+        self.conn_menu.add_separator()
         self.conn_menu.add_command(label="详情", command=self.view_connection_details)
         
         self.conn_tree.bind("<Button-3>", self.show_connection_menu)
@@ -1520,6 +1758,9 @@ class ProxyGUI:
             
             # 加载上次启动时间
             self.last_start_time = self.config.get('last_start_time')
+            
+            # 加载黑名单
+            self.blacklist = self.config.get('blacklist', [])
             
             # 更新上次运行时间标签并显示详细信息
             if self.last_start_time:
@@ -1734,6 +1975,29 @@ class ProxyGUI:
         item = self.conn_tree.identify_row(event.y)
         if item:
             self.conn_tree.selection_set(item)
+            
+            # 获取选中的IP
+            values = self.conn_tree.item(item)['values']
+            if values:
+                ip = values[0]
+                
+                # 动态更新菜单项状态
+                self.conn_menu.delete(0, tk.END)  # 清空菜单
+                
+                # 添加基本菜单项
+                self.conn_menu.add_command(label="断开", command=self.disconnect_connection)
+                self.conn_menu.add_command(label="复制IP", command=self.copy_connection_ip)
+                self.conn_menu.add_separator()
+                
+                # 根据IP是否在黑名单中添加相应菜单项
+                if ip in self.blacklist:
+                    self.conn_menu.add_command(label="从黑名单移除", command=self.remove_from_blacklist)
+                else:
+                    self.conn_menu.add_command(label="加入黑名单", command=self.add_to_blacklist)
+                
+                self.conn_menu.add_separator()
+                self.conn_menu.add_command(label="详情", command=self.view_connection_details)
+            
             self.conn_menu.post(event.x_root, event.y_root)
             
     def disconnect_connection(self):
