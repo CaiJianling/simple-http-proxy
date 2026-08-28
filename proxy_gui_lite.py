@@ -15,9 +15,18 @@ import time
 import threading
 import queue
 import os
+import sys
 import json
 from datetime import datetime
 import struct
+
+# 系统托盘相关依赖（可选，缺失时降级为普通最小化）
+try:
+    import pystray
+    from PIL import Image, ImageDraw, ImageFont
+    TRAY_AVAILABLE = True
+except Exception:
+    TRAY_AVAILABLE = False
 
 
 class ConfigManager:
@@ -93,10 +102,11 @@ class ConfigManager:
 class ProxyServer:
     """代理服务器核心类"""
     
-    def __init__(self):
+    def __init__(self, blacklist=None):
         self.server_socket = None
         self.running = False
         self.clients = {}
+        self.blacklist = blacklist or []  # 黑名单
         
         # 基本配置
         self.buffer_size = 1024
@@ -167,6 +177,10 @@ class ProxyServer:
             
     def handle_client(self, client_socket, client_address):
         """处理客户端连接"""
+        # 提前初始化，确保 finally 块（含黑名单早返回/异常路径）始终能访问到
+        bytes_sent = 0
+        bytes_received = 0
+        protocol_type = "Unknown"
         try:
             # 检查黑名单
             client_ip = client_address[0]
@@ -178,35 +192,32 @@ class ProxyServer:
                         'message': f"黑名单IP {client_ip} 尝试连接已被拒绝",
                         'timestamp': datetime.now()
                     })
-                
+
                 # 发送拒绝响应
                 try:
                     error_response = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
                     client_socket.send(error_response)
+                    bytes_sent = len(error_response)
                 except:
                     pass
-                
+
                 client_socket.close()
                 return
-            
+
             # 更新统计信息
             self.stats['total_connections'] += 1
             self.stats['active_connections'] += 1
 
-            bytes_sent = 0
-            bytes_received = 0
-            protocol_type = "Unknown"
-            
             # 接收客户端初始请求数据以判断协议类型
             try:
                 # 临时设置为阻塞模式以便接收初始数据
                 client_socket.setblocking(True)
                 client_socket.settimeout(5.0)  # 设置5秒超时
-                
+
                 data = client_socket.recv(self.buffer_size)
                 if not data:
                     return
-                
+
                 bytes_received += len(data)
                 self.stats['total_bytes_received'] += len(data)
                 
@@ -881,31 +892,46 @@ class ProxyGUI:
         self.setup_styles()
         
         # 代理服务器实例
-        self.proxy_server = ProxyServer()
+        self.proxy_server = ProxyServer(blacklist=self.blacklist)
         self.server_thread = None
         
         # 队列用于线程间通信
         self.log_queue = queue.Queue()
         self.stats_queue = queue.Queue()
-        
+
+        # 系统托盘相关状态
+        self._tray_icon = None
+        self._tray_hiding = False
+        self._tray_quitting = False
+
+        # 流量速率统计状态（用于当前速率与峰值速率计算）
+        self._rate_last_time = None
+        self._rate_last_sent = 0
+        self._rate_last_received = 0
+        self._peak_sent_rate = 0.0
+        self._peak_received_rate = 0.0
+
         # 创建界面
         self.create_widgets()
-        
+
         # 加载保存的配置
         self.load_saved_config()
-        
+
         # 启动更新定时器
         self.update_gui()
-        
+
         # 如果配置了自动启动，或者上次关闭时服务器正在运行，则启动服务器
         should_auto_start = self.config.get('auto_start', False) or self.config.get('server_running', False)
         if should_auto_start:
             self.root.after(1000, self.auto_start_server)
             if self.config.get('server_running', False):
                 self.add_log("检测到上次异常关闭，正在自动恢复服务...", 'info')
-            
-        # 绑定窗口关闭事件
+
+        # 绑定窗口关闭事件：点关闭按钮直接关闭程序
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # 绑定最小化事件：最小化时缩小到系统托盘
+        self.root.bind("<Unmap>", self._on_unmap)
         
     def setup_window_style(self):
         """设置窗口样式"""
@@ -1107,6 +1133,9 @@ class ProxyGUI:
             else:
                 self.blacklist = []
             
+            # 更新代理服务器的黑名单
+            self.proxy_server.blacklist = self.blacklist.copy()
+            
             # 保存配置
             self.save_current_config()
             
@@ -1163,6 +1192,7 @@ class ProxyGUI:
                     
                     if ip not in self.blacklist:
                         self.blacklist.append(ip)
+                        self.proxy_server.blacklist = self.blacklist.copy()  # 更新代理服务器的黑名单
                         self.save_current_config()
                         self.add_log(f"🚫 已将IP {ip} 加入黑名单", 'info')
                         messagebox.showinfo("提示", f"已将IP {ip} 加入黑名单")
@@ -1192,6 +1222,7 @@ class ProxyGUI:
                     
                     if ip in self.blacklist:
                         self.blacklist.remove(ip)
+                        self.proxy_server.blacklist = self.blacklist.copy()  # 更新代理服务器的黑名单
                         self.save_current_config()
                         self.add_log(f"✅ 已将IP {ip} 从黑名单移除", 'info')
                         messagebox.showinfo("提示", f"已将IP {ip} 从黑名单移除")
@@ -1476,7 +1507,16 @@ class ProxyGUI:
             foreground=self.colors['accent'],
             font=('Arial', 8)
         )
-        self.run_duration_label.grid(row=2, column=0, columnspan=4, pady=(0, 10))
+        self.run_duration_label.grid(row=2, column=0, columnspan=4, pady=(0, 5))
+        
+        # 黑名单数量显示
+        self.blacklist_count_label = ttk.Label(
+            status_frame,
+            text="黑名单: 0个IP",
+            foreground=self.colors['danger'],
+            font=('Arial', 8)
+        )
+        self.blacklist_count_label.grid(row=3, column=0, columnspan=4, pady=(0, 10))
         
         # 统计信息 - 两列布局
         stats_items = [
@@ -1490,7 +1530,7 @@ class ProxyGUI:
         
         # 两列布局，每行两个项目（总共2行，4个项目）
         for i, (label, key) in enumerate(stats_items):
-            row = i // 2 + 3  # 从第3行开始，因为第0行是状态指示器，第1行是上次运行时间，第2行是运行时长
+            row = i // 2 + 4  # 从第4行开始，因为第0行是状态指示器，第1行是上次运行时间，第2行是运行时长，第3行是黑名单数量
             col = (i % 2) * 2  # 0, 2, 0, 2 列模式
             
             ttk.Label(status_frame, text=label, font=('Arial', 9)).grid(row=row, column=col, sticky=tk.E, padx=(0, 3), pady=2)
@@ -1651,7 +1691,10 @@ class ProxyGUI:
                 current_config['last_start_time'] = self.last_start_time
                 self.config_manager.save_config(current_config)
                 self.add_log("配置已保存", 'info')
-                
+
+                # 重置速率统计（启动时清零峰值与基线）
+                self._reset_rate_stats()
+
                 # 更新界面状态
                 self.status_label.config(
                     text="● 运行中",
@@ -1688,7 +1731,7 @@ class ProxyGUI:
         """停止服务器"""
         try:
             self.proxy_server.stop()
-            
+
                 # 保存当前配置（包括停止状态，但保留上次启动时间）
             current_config = self.config_manager.get_current_config(self)
             current_config['server_running'] = False
@@ -1696,7 +1739,17 @@ class ProxyGUI:
             if hasattr(self, 'last_start_time') and self.last_start_time:
                 current_config['last_start_time'] = self.last_start_time
             self.config_manager.save_config(current_config)
-            
+
+            # 重置速率统计（停止时清零当前/峰值显示）
+            self._reset_rate_stats()
+
+            # 清空连接列表（停止后不再有 stats_queue 推送，需主动刷新一次）
+            try:
+                self.proxy_server.clients.clear()
+            except Exception:
+                pass
+            self.update_connections_list()
+
             # 更新界面状态
             self.status_label.config(
                 text="● 已停止",
@@ -1704,14 +1757,14 @@ class ProxyGUI:
             )
             self.start_button.config(state=tk.NORMAL)
             self.stop_button.config(state=tk.DISABLED)
-            
+
             # 启用设置输入
             self.host_entry.config(state=tk.NORMAL)
             self.port_entry.config(state=tk.NORMAL)
             self.buffer_entry.config(state=tk.NORMAL)
             self.delay_entry.config(state=tk.NORMAL)
             self.max_clients_entry.config(state=tk.NORMAL)
-            
+
             self.add_log("服务器已停止", 'info')
             
         except Exception as e:
@@ -1730,15 +1783,19 @@ class ProxyGUI:
             while not self.log_queue.empty():
                 log_data = self.log_queue.get_nowait()
                 self.add_log(log_data['message'], log_data['type'])
-                
+
             # 处理统计队列
             while not self.stats_queue.empty():
                 stats = self.stats_queue.get_nowait()
                 self.update_stats(stats)
-                
+
         except queue.Empty:
             pass
-            
+        except Exception as e:
+            # 单次更新中的异常不应打断整个刷新循环
+            # （否则连接列表/统计/日志会全部冻结）
+            print(f"update_gui 单次刷新出错（已忽略）: {e}")
+
         # 继续更新
         self.root.after(100, self.update_gui)
         
@@ -1761,6 +1818,11 @@ class ProxyGUI:
             
             # 加载黑名单
             self.blacklist = self.config.get('blacklist', [])
+            
+            # 更新黑名单数量显示
+            if hasattr(self, 'blacklist_count_label'):
+                blacklist_count = len(self.blacklist)
+                self.blacklist_count_label.config(text=f"黑名单: {blacklist_count}个IP")
             
             # 更新上次运行时间标签并显示详细信息
             if self.last_start_time:
@@ -1885,22 +1947,154 @@ class ProxyGUI:
             print(f"保存自动启动设置失败: {e}")
             
     def on_closing(self):
-        """窗口关闭时的处理"""
+        """窗口关闭时的处理（点关闭按钮=直接关闭程序）"""
+        # 防止重复触发
+        if getattr(self, '_tray_quitting', False):
+            return
+        self._tray_quitting = True
         try:
+            # 先停止托盘图标
+            self._stop_tray_icon()
             # 保存当前配置
             self.save_current_config()
-            
             # 如果服务器正在运行，先停止它
             if self.proxy_server.running:
                 self.proxy_server.stop()
-                
             # 销毁窗口
             self.root.destroy()
-            
         except Exception as e:
             print(f"关闭窗口时出错: {e}")
             self.root.destroy()
-        
+
+    # ---------------- 系统托盘功能 ----------------
+
+    def _on_unmap(self, event):
+        """窗口最小化时缩小到系统托盘"""
+        if event.widget is not self.root:
+            return
+        if self._tray_hiding or self._tray_quitting:
+            return
+        try:
+            # 只有真正最小化（iconic 状态）才进托盘
+            # Windows 下 state() 返回 'iconic'，部分平台为 'icon'
+            if str(self.root.state()) in ('icon', 'iconic'):
+                self._tray_hiding = True
+                self.root.withdraw()  # 隐藏窗口到托盘
+                self._show_tray_icon()
+        except Exception:
+            self._tray_hiding = False
+
+    def _create_tray_image(self):
+        """生成托盘图标（无图标文件时用PIL绘制）"""
+        try:
+            size = 64
+            img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            # 蓝色圆角背景
+            margin = 4
+            draw.rounded_rectangle(
+                [margin, margin, size - margin, size - margin],
+                radius=12, fill=(0, 122, 204, 255)
+            )
+            # 白色双向箭头表示代理转发
+            cx, cy = size // 2, size // 2
+            # 上行箭头
+            draw.line([(cx - 14, cy + 6), (cx - 14, cy - 8)], fill='white', width=4)
+            draw.polygon(
+                [(cx - 14, cy - 12), (cx - 19, cy - 5), (cx - 9, cy - 5)],
+                fill='white'
+            )
+            # 下行箭头
+            draw.line([(cx + 14, cy - 6), (cx + 14, cy + 8)], fill='white', width=4)
+            draw.polygon(
+                [(cx + 14, cy + 12), (cx + 9, cy + 5), (cx + 19, cy + 5)],
+                fill='white'
+            )
+            return img
+        except Exception:
+            return None
+
+    def _tray_setup(self, icon):
+        """托盘图标就绪后回调：显示图标并弹出气泡提示"""
+        try:
+            icon.visible = True
+        except Exception:
+            pass
+        try:
+            # 弹出气泡通知用户已最小化到托盘
+            icon.notify(
+                "程序已最小化到系统托盘，双击图标或右键菜单可恢复窗口",
+                "网络代理服务器",
+            )
+        except Exception:
+            pass
+
+    def _show_tray_icon(self):
+        """显示系统托盘图标"""
+        if not TRAY_AVAILABLE:
+            # 无依赖则退化为普通最小化
+            self._tray_hiding = False
+            try:
+                self.root.deiconify()
+                self.root.iconify()
+            except Exception:
+                pass
+            return
+        if self._tray_icon is not None:
+            return  # 已显示
+        try:
+            image = self._create_tray_image()
+            menu = pystray.Menu(
+                pystray.MenuItem("显示主窗口", self._tray_show_window, default=True),
+                pystray.MenuItem("退出程序", self._tray_quit_app),
+            )
+            self._tray_icon = pystray.Icon(
+                "ProxyServerTray",
+                image,
+                "网络代理服务器",
+                menu,
+            )
+            # 在后台线程运行托盘消息循环，并传入 setup 回调以在就绪后弹气泡
+            threading.Thread(
+                target=self._tray_icon.run,
+                args=(self._tray_setup,),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            print(f"启动托盘图标失败: {e}")
+            self._tray_icon = None
+            self._tray_hiding = False
+
+    def _stop_tray_icon(self):
+        """停止托盘图标"""
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
+
+    def _tray_show_window(self, icon=None, item=None):
+        """从托盘恢复显示主窗口（在托盘线程中调用）"""
+        # 必须在Tk主线程中操作UI
+        self.root.after(0, self._restore_window)
+
+    def _restore_window(self):
+        """恢复主窗口"""
+        self._tray_hiding = False
+        try:
+            self._stop_tray_icon()
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def _tray_quit_app(self, icon=None, item=None):
+        """从托盘退出程序（在托盘线程中调用）"""
+        # 必须在Tk主线程中关闭
+        self.root.after(0, self.on_closing)
+
     def update_stats(self, stats):
         """更新统计信息"""
         # 更新统计标签
@@ -1945,30 +2139,48 @@ class ProxyGUI:
         # 清除现有项目
         for item in self.conn_tree.get_children():
             self.conn_tree.delete(item)
-        
+
         # 更新连接数量
         conn_count = len(self.proxy_server.clients)
         self.conn_count_label.config(text=f"当前连接: {conn_count}")
-            
+
+        # 更新黑名单数量
+        blacklist_count = len(self.blacklist) if hasattr(self, 'blacklist') else 0
+        if hasattr(self, 'blacklist_count_label'):
+            self.blacklist_count_label.config(text=f"黑名单: {blacklist_count}个IP")
+
         # 添加活跃连接
-        for addr, info in self.proxy_server.clients.items():
-            protocol = info.get('protocol', 'Unknown')
-            
-            # 计算连接时长
-            duration = datetime.now() - info['connect_time']
-            duration_str = str(duration).split('.')[0]  # 移除微秒
-            
-            # 计算流量
-            total_traffic = info.get('bytes_sent', 0) + info.get('bytes_received', 0)
-            traffic_str = self.format_bytes(total_traffic)
-            
-            self.conn_tree.insert('', tk.END, values=(
-                addr[0],
-                addr[1],
-                protocol,
-                duration_str,
-                traffic_str
-            ))
+        # 注意：self.proxy_server.clients 会被工作线程在连接关闭时增删，
+        # 直接 .items() 迭代可能抛出 RuntimeError: dictionary changed size
+        # during iteration，从而打断整个 update_gui 循环（update_gui 只捕获
+        # queue.Empty），导致连接列表/统计/日志全部冻结。这里取快照避免竞争。
+        try:
+            clients_snapshot = list(self.proxy_server.clients.items())
+        except RuntimeError:
+            clients_snapshot = []
+
+        for addr, info in clients_snapshot:
+            try:
+                protocol = info.get('protocol', 'Unknown')
+
+                # 计算连接时长
+                duration = datetime.now() - info['connect_time']
+                duration_str = str(duration).split('.')[0]  # 移除微秒
+
+                # 计算流量
+                total_traffic = info.get('bytes_sent', 0) + info.get('bytes_received', 0)
+                traffic_str = self.format_bytes(total_traffic)
+
+                self.conn_tree.insert('', tk.END, values=(
+                    addr[0],
+                    addr[1],
+                    protocol,
+                    duration_str,
+                    traffic_str
+                ))
+            except Exception:
+                # 单条连接信息异常时跳过，不影响整体刷新
+                continue
             
     def show_connection_menu(self, event):
         """显示连接列表右键菜单"""
@@ -2055,26 +2267,60 @@ class ProxyGUI:
         """更新流量图表"""
         # 更新图表数据
         self.traffic_canvas.update_traffic(stats['total_bytes_sent'], stats['total_bytes_received'])
-        
-        # 计算当前流量速率（简化计算）
-        current_sent_rate = 0
-        current_received_rate = 0
-        
-        if self.proxy_server.traffic_history:
-            recent_data = self.proxy_server.traffic_history[-5:]  # 最近5条记录
-            if len(recent_data) > 1:
-                # 简单的速率计算
-                total_sent = sum(item['bytes_sent'] for item in recent_data)
-                total_received = sum(item['bytes_received'] for item in recent_data)
-                time_span = (recent_data[-1]['time'] - recent_data[0]['time']).total_seconds()
-                
-                if time_span > 0:
-                    current_sent_rate = total_sent / time_span
-                    current_received_rate = total_received / time_span
-        
+
+        # 计算当前流量速率：基于总字节数的增量 / 采样间隔时间
+        now = datetime.now()
+        current_sent_rate = 0.0
+        current_received_rate = 0.0
+
+        if self._rate_last_time is not None:
+            elapsed = (now - self._rate_last_time).total_seconds()
+            if elapsed > 0:
+                sent_delta = stats['total_bytes_sent'] - self._rate_last_sent
+                received_delta = stats['total_bytes_received'] - self._rate_last_received
+                # 增量为负说明计数被重置（如重启），此时不计算本次速率
+                if sent_delta >= 0:
+                    current_sent_rate = sent_delta / elapsed
+                if received_delta >= 0:
+                    current_received_rate = received_delta / elapsed
+
+        # 更新采样基线
+        self._rate_last_time = now
+        self._rate_last_sent = stats['total_bytes_sent']
+        self._rate_last_received = stats['total_bytes_received']
+
+        # 更新峰值速率
+        if current_sent_rate > self._peak_sent_rate:
+            self._peak_sent_rate = current_sent_rate
+        if current_received_rate > self._peak_received_rate:
+            self._peak_received_rate = current_received_rate
+
         # 更新流量标签
-        self.traffic_labels['current_sent'].config(text=f"当前发送: {self.format_bytes(current_sent_rate)}/s")
-        self.traffic_labels['current_received'].config(text=f"当前接收: {self.format_bytes(current_received_rate)}/s")
+        self.traffic_labels['current_sent'].config(
+            text=f"发送: {self.format_bytes(current_sent_rate)}/s")
+        self.traffic_labels['current_received'].config(
+            text=f"接收: {self.format_bytes(current_received_rate)}/s")
+        self.traffic_labels['peak_sent'].config(
+            text=f"发送: {self.format_bytes(self._peak_sent_rate)}/s")
+        self.traffic_labels['peak_received'].config(
+            text=f"接收: {self.format_bytes(self._peak_received_rate)}/s")
+
+    def _reset_rate_stats(self):
+        """重置速率统计（在服务器启动/停止时调用）"""
+        self._rate_last_time = None
+        self._rate_last_sent = 0
+        self._rate_last_received = 0
+        self._peak_sent_rate = 0.0
+        self._peak_received_rate = 0.0
+        # 重置界面显示
+        if hasattr(self, 'traffic_labels'):
+            try:
+                self.traffic_labels['current_sent'].config(text="发送: 0 B/s")
+                self.traffic_labels['current_received'].config(text="接收: 0 B/s")
+                self.traffic_labels['peak_sent'].config(text="发送: 0 B/s")
+                self.traffic_labels['peak_received'].config(text="接收: 0 B/s")
+            except Exception:
+                pass
         
     def format_bytes(self, bytes):
         """格式化字节数显示"""

@@ -1,2 +1,5 @@
 # 轻量版依赖（无需matplotlib）
 tkinter-tooltip==2.1.0
+# 系统托盘图标依赖（最小化到托盘所需）
+pystray>=0.19.0
+Pillow>=9.5.0
